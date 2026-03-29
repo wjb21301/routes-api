@@ -74,6 +74,12 @@ func routeTranslator(req RouteRequest) (GoogleRouteRequest, error) {
 	return googleReq, nil
 }
 func RouteHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+	w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
+	if r.Method == "OPTIONS" {
+    	return
+	}
 	if r.Method != "POST" {
 		w.WriteHeader(405)
 		w.Write([]byte(`{"error": "Invalid send type"}`))
@@ -183,13 +189,17 @@ func RouteHandler(w http.ResponseWriter, r *http.Request) {
 func main() {
 	err := godotenv.Load()
 	if err != nil {
-		log.Fatal("Error loading .env file.")
+		log.Println("No .env file found.")
 	}
 	http.HandleFunc("/route", RouteHandler)
-	fmt.Println("Server running on http://localhost:8080")
-	err = http.ListenAndServe(":8080", nil)
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
+	}
+	fmt.Println("Server running on port" , port)
+	err = http.ListenAndServe(":"+port, nil)
 	if err != nil {
-		fmt.Println("Server failed", err)
+		log.Fatal("Server Failed:", err)
 	}
 
 }
