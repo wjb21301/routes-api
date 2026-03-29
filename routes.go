@@ -21,7 +21,11 @@ import (
 var firebaseApp *firebase.App
 
 func initFirebase() {
-	opt := option.WithAuthCredentialsFile(option.ServiceAccount, "serviceAccountKey.json")
+	creds := os.Getenv("FIREBASE_CREDENTIALS")
+	if creds == "" {
+		log.Fatal("Missing FIREBASE_CREDENTIALS")
+	}
+	opt := option.WithAuthCredentialsJSON(option.ServiceAccount, []byte(creds))
 	app, err := firebase.NewApp(context.Background(), nil, opt)
 	if err != nil {
 		log.Fatalf("error initializing firebase: %v\n", err)
