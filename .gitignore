@@ -2,3 +2,4 @@
 app
 .exe
 *.log
+serviceAccountKey.json

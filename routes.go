@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -12,8 +13,21 @@ import (
 	"strings"
 	"time"
 
+	firebase "firebase.google.com/go"
 	"github.com/joho/godotenv"
+	"google.golang.org/api/option"
 )
+
+var firebaseApp *firebase.App
+
+func initFirebase() {
+	opt := option.WithAuthCredentialsFile(option.ServiceAccount, "serviceAccountKey.json")
+	app, err := firebase.NewApp(context.Background(), nil, opt)
+	if err != nil {
+		log.Fatalf("error initializing firebase: %v\n", err)
+	}
+	firebaseApp = app
+}
 
 type RouteRequest struct {
 	Origin      LatLng `json:"origin"`
@@ -75,11 +89,48 @@ func routeTranslator(req RouteRequest) (GoogleRouteRequest, error) {
 }
 func RouteHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
 	w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
 	if r.Method == "OPTIONS" {
-    	return
+		w.WriteHeader(http.StatusOK)
+		return
 	}
+	if firebaseApp == nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	authHeader := r.Header.Get("Authorization")
+	if authHeader == "" {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		w.Write([]byte(`{"error": "Missing token"}`))
+		return
+	}
+
+	if !strings.HasPrefix(authHeader, "Bearer ") {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		w.Write([]byte(`{"error": "Invalid auth format"}`))
+		return
+	}
+
+	idToken := strings.TrimPrefix(authHeader, "Bearer ")
+
+	authClient, err := firebaseApp.Auth(context.Background())
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	token, err := authClient.VerifyIDToken(context.Background(), idToken)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		w.Write([]byte(`{"error": "Invalid token"}`))
+		return
+	}
+	log.Println("User authenticated:", token.UID)
+
 	if r.Method != "POST" {
 		w.WriteHeader(405)
 		w.Write([]byte(`{"error": "Invalid send type"}`))
@@ -87,7 +138,7 @@ func RouteHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	req := RouteRequest{}
 	decoder := json.NewDecoder(r.Body)
-	err := decoder.Decode(&req)
+	err = decoder.Decode(&req)
 	if err != nil {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(400)
@@ -95,47 +146,60 @@ func RouteHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if req.Mode == "" {
+		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(400)
 		w.Write([]byte(`{"error": "You must have a mode of traveling."}`))
 		return
 	}
 	if req.Origin.Latitude < -90 || req.Origin.Latitude > 90 || req.Origin.Longitude < -180 || req.Origin.Longitude > 180 {
+		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(400)
 		w.Write([]byte(`{"error": "Invalid Coordinates"}`))
 		return
 	}
 	if req.Destination.Latitude < -90 || req.Destination.Latitude > 90 || req.Destination.Longitude < -180 || req.Destination.Longitude > 180 {
+		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(400)
 		w.Write([]byte(`{"error": "Invalid Coordinates"}`))
 		return
 	}
 	googleReq, err := routeTranslator(req)
 	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusBadRequest)
 		w.Write([]byte(`{"error": "Bad request"}`))
 		return
 	}
 	apiKey := os.Getenv("GOOGLE_ROUTES_API_KEY")
 	if apiKey == "" {
-		log.Println("Could not load api key.")
+		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte(`{"error": "Missing API key"}`))
 		return
 	}
 	payload, err := json.Marshal(googleReq)
 	if err != nil {
 		log.Println("Error marhshaliing google request:", err)
+		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
 	googleURL := "https://routes.googleapis.com/directions/v2:computeRoutes"
 	client := http.DefaultClient
-	reqGoogle, _ := http.NewRequest("POST", googleURL, bytes.NewReader(payload))
+	reqGoogle, err := http.NewRequest("POST", googleURL, bytes.NewReader(payload))
+	if err != nil {
+		log.Println("Error creating request:", err)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
 	reqGoogle.Header.Set("Content-Type", "application/json")
 	reqGoogle.Header.Set("X-Goog-Api-Key", apiKey)
 	reqGoogle.Header.Set("X-Goog-FieldMask", "routes.duration,routes.distanceMeters,routes.polyline.encodedPolyline")
 	resp, err := client.Do(reqGoogle)
 	if err != nil {
 		log.Println("Error calling google routes: ", err)
+		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
@@ -143,6 +207,7 @@ func RouteHandler(w http.ResponseWriter, r *http.Request) {
 	if resp.StatusCode != http.StatusOK {
 		bodyBytes, _ := io.ReadAll(resp.Body)
 		log.Println("Google returned non-200:", resp.StatusCode, string(bodyBytes))
+		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusBadGateway)
 		w.Write([]byte(`{"error": "Failed to fetch route from Google"}`))
 		return
@@ -159,11 +224,13 @@ func RouteHandler(w http.ResponseWriter, r *http.Request) {
 	err = json.NewDecoder(resp.Body).Decode(&googleResp)
 	if err != nil {
 		log.Println("Error decoding Google response:", err)
+		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
 	if len(googleResp.Routes) == 0 {
 		w.WriteHeader(http.StatusNotFound)
+		w.Header().Set("Content-Type", "application/json")
 		w.Write([]byte(`{"error": "No route found"}`))
 		return
 	}
@@ -191,12 +258,13 @@ func main() {
 	if err != nil {
 		log.Println("No .env file found.")
 	}
+	initFirebase()
 	http.HandleFunc("/route", RouteHandler)
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080"
 	}
-	fmt.Println("Server running on port" , port)
+	fmt.Println("Server running on port", port)
 	err = http.ListenAndServe(":"+port, nil)
 	if err != nil {
 		log.Fatal("Server Failed:", err)
